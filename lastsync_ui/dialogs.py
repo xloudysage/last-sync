@@ -147,7 +147,7 @@ class SettingsDialog(QDialog):
             return container, f
 
         section("LAST.FM")
-        w1, self.lfm_user = field_row("username")
+        w1, self.lfm_user = field_row("default username (optional)")
         w2, self.lfm_key  = field_row("api key", pwd=True)
         lay.addWidget(w1)
         lay.addSpacing(8)
@@ -155,7 +155,7 @@ class SettingsDialog(QDialog):
         lay.addSpacing(20)
 
         section("SPOTIFY")
-        w3, self.sp_id  = field_row("client id",     pwd=True)
+        w3, self.sp_id  = field_row("client id for playback",     pwd=True)
         lay.addWidget(w3)
         lay.addSpacing(8)
         lay.addSpacing(8)
@@ -201,7 +201,7 @@ class SettingsDialog(QDialog):
 
     def _on_save(self):
         any_empty = False
-        for f in self._fields.values():
+        for f in (self.lfm_key,):
             if not f.text().strip():
                 f.setStyleSheet(self._FIELD_ERR)
                 any_empty = True
@@ -214,7 +214,7 @@ class SettingsDialog(QDialog):
         return {k: f.text().strip() for k, f in self._fields.items()}
 
     def is_valid(self) -> bool:
-        return all(f.text().strip() for f in self._fields.values())
+        return bool(self.lfm_key.text().strip())
 
 
 # ── Main window ────────────────────────────────────────────────

@@ -10,11 +10,14 @@ class SyncEngine:
     def __init__(self, lastfm, spotify, resolver, username, *, clock=time.monotonic,
                  stopped=lambda: False, on_state=lambda *a: None,
                  on_track=lambda *a: None, on_progress=lambda *a: None,
-                 on_match=lambda *a: None):
+                 on_match=lambda *a: None, start_position=None, single_track=False):
         self.lastfm, self.spotify, self.resolver = lastfm, spotify, resolver
         self.username, self.clock, self.cancelled = username, clock, stopped
         self.on_state, self.on_track = on_state, on_track
         self.on_progress, self.on_match = on_progress, on_match
+        self.start_position = start_position
+        self.single_track = single_track
+        self.follow_message = "Following track; source position unknown"
         self.state = SyncState.IDLE
         self.message = "Ready"
         self.retry = RetryPolicy()
@@ -101,9 +104,11 @@ class SyncEngine:
                     self.pending = None
                     self.owned = (candidate.uri, device)
                     self.confirmed_event = self.event_id
-                    self.transition(SyncState.FOLLOWING, "Following track; source position unknown")
+                    self.transition(SyncState.FOLLOWING, self.follow_message)
                     self.on_track(self.source, candidate)
                     self.on_progress(playback)
+                    if self.single_track:
+                        self.stop("Selected track is playing on Spotify")
                 elif self.clock() - sent_at >= 10:
                     # A timed-out command may have been applied. Never resend blindly.
                     self.stop("Playback start could not be confirmed; check Spotify, then press Start")
@@ -112,7 +117,7 @@ class SyncEngine:
                 return POLL_ACTIVE
             if self.confirmed_event == self.event_id and self.owned:
                 if playback and playback.uri == self.owned[0]:
-                    self.transition(SyncState.FOLLOWING, "Following track; source position unknown")
+                    self.transition(SyncState.FOLLOWING, self.follow_message)
                     self.on_progress(playback)
                 return POLL_ACTIVE
             if self.resolution is None or (not self.resolution.selected and self.clock() >= self.no_match_until):
@@ -137,11 +142,18 @@ class SyncEngine:
                 self.transition(SyncState.RECOVERING, message)
                 return POLL_IDLE
             candidate = self.resolution.selected
-            self.transition(SyncState.STARTING, "Starting matched track from the beginning")
+            position = self.start_position(candidate) if self.start_position else None
+            self.follow_message = ("Following from the supplied source position" if position is not None else
+                                   "Following from the beginning; source position unavailable")
+            self.transition(SyncState.STARTING, "Starting from the supplied position" if position is not None else
+                            "Starting matched track from the beginning")
             self.pending = (candidate, device, self.clock())
             try:
                 if not self.cancelled():
-                    self._call("Spotify", lambda: self.spotify.start(candidate.uri, device))
+                    if position is None:
+                        self._call("Spotify", lambda: self.spotify.start(candidate.uri, device))
+                    else:
+                        self._call("Spotify", lambda: self.spotify.start(candidate.uri, device, position))
             except ServiceError as error:
                 if not error.uncertain:
                     self.pending = None  # Explicit rejection is safe to retry after backoff.

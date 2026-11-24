@@ -27,7 +27,7 @@ class MatchStore:
             # Serialize schema discovery as well as updates across app instances.
             self.db.execute("BEGIN IMMEDIATE")
             version = self.db.execute("PRAGMA user_version").fetchone()[0]
-            if version > 2:
+            if version > 3:
                 raise RuntimeError("Match database is newer than this application")
             if version < 1:
                 self.db.execute("""CREATE TABLE matches (
@@ -48,6 +48,46 @@ class MatchStore:
                     expires REAL NOT NULL, PRIMARY KEY(namespace, query))""")
                 self.db.execute("CREATE INDEX search_expiry ON search_cache(expires)")
                 self.db.execute("PRAGMA user_version=2")
+            if version < 3:
+                self.db.execute("""CREATE TABLE friends (username TEXT PRIMARY KEY COLLATE NOCASE,
+                                 ordering INTEGER NOT NULL)""")
+                self.db.execute("CREATE TABLE preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                self.db.execute("PRAGMA user_version=3")
+
+    def seed_friends(self, username):
+        if not username:
+            return
+        with self.db:
+            added = self.db.execute("INSERT OR IGNORE INTO preferences VALUES ('imported_source','1')").rowcount
+            if added:
+                self.db.execute("INSERT OR IGNORE INTO friends VALUES (?,0)", (username,))
+
+    def friends(self):
+        return [row[0] for row in self.db.execute("SELECT username FROM friends ORDER BY ordering,username")]
+
+    def add_friend(self, username):
+        username = username.strip()
+        if not username or len(username) > 64 or any(c.isspace() or not c.isprintable() or c in '/?#\\'
+                                                     for c in username):
+            raise ValueError("Enter a Last.fm username, without a URL or spaces.")
+        with self.db:
+            self.db.execute("INSERT OR IGNORE INTO friends SELECT ?,coalesce(max(ordering),-1)+1 FROM friends",
+                            (username,))
+
+    def remove_friend(self, username):
+        with self.db:
+            self.db.execute("DELETE FROM friends WHERE username=?", (username,))
+
+    def move_friend(self, username, delta):
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            names = self.friends()
+            if username not in names:
+                return
+            old = names.index(username)
+            target = max(0, min(len(names)-1, old + delta))
+            names.insert(target, names.pop(old))
+            self.db.executemany("UPDATE friends SET ordering=? WHERE username=?", enumerate(names))
 
     def begin_session(self, username, selected_device):
         username = username.strip()

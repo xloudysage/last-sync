@@ -1,6 +1,7 @@
 import hashlib
 from queue import Empty, Full, Queue
 import threading
+import time
 
 import httpx
 from PyQt6.QtCore import QThread, pyqtSignal
@@ -16,6 +17,7 @@ from .models import SyncState
 from .storage import MatchStore
 from .sync import SyncEngine
 from .diagnostics import log
+from .friends import BEST_EFFORT, DISCOVERY, TRACK_FOLLOW, PickedTrack
 
 
 class SyncWorker(QThread):
@@ -26,9 +28,10 @@ class SyncWorker(QThread):
     matching_required = pyqtSignal(int, object, object)
     poll_interval_changed = pyqtSignal(int)
 
-    def __init__(self, sp, cfg):
+    def __init__(self, sp, cfg, *, monitor=None, mode=TRACK_FOLLOW, picked=None, hint=None):
         super().__init__()
         self.sp, self.cfg = sp, dict(cfg)
+        self.monitor, self.mode, self.picked, self.hint = monitor, mode, picked, hint
         self._stop_event, self._wake = threading.Event(), threading.Event()
         self._commands = Queue(maxsize=10)
 
@@ -46,7 +49,15 @@ class SyncWorker(QThread):
         session = None
         outcome = "failed"
         try:
-            lastfm = LastFMClient(self.cfg["lastfm_api_key"])
+            if self.mode == DISCOVERY:
+                if self.picked is None:
+                    raise ValueError("Discovery requires a selected track")
+                source = PickedTrack(self.picked)
+            elif self.monitor is not None:
+                source = self.monitor
+            else:
+                lastfm = source = LastFMClient(self.cfg["lastfm_api_key"])
+            username = self.cfg["lastfm_user"]
             namespace = getattr(self.sp, "namespace", self.cfg["spotify_client_id"])
             store = MatchStore(data_directory() / "matches.sqlite3", namespace)
             self.sp.catalog_cache = store
@@ -58,7 +69,13 @@ class SyncWorker(QThread):
                 self.track_changed.emit(source.title, source.artist, 0,
                                         candidate.track.duration_ms or 0, candidate.artwork)
 
-            engine = SyncEngine(lastfm, self.sp, TrackResolver(self.sp, store), self.cfg["lastfm_user"],
+            def start_position(candidate):
+                if self.mode == BEST_EFFORT and self.hint and self.monitor:
+                    return self.hint.position(self.monitor.activity(username), candidate, time.monotonic())
+                return None
+
+            engine = SyncEngine(source, self.sp, TrackResolver(self.sp, store), username,
+                                start_position=start_position, single_track=self.mode == DISCOVERY,
                                 stopped=self._stop_event.is_set,
                                 on_state=lambda state, message: self.state_changed.emit(state.value, message),
                                 on_track=report_track, on_progress=self.playback_changed.emit,

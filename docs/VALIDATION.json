@@ -1,7 +1,7 @@
 {
-  "release": "1.2.0",
+  "release": "2.0.0",
   "date": "2026-11-24",
-  "tests_passed": 76,
+  "tests_passed": 91,
   "tests_failed": 0,
   "python": "3.13.15",
   "pyqt": "6.11.0",
@@ -14,6 +14,8 @@
   "live_service_tests": "No real Spotify or Last.fm account integration run for this release.",
   "os_credential_integration": "not verified: managed sandbox access denied; memory backend tested",
   "installer": "Inno Setup 6.7.4 compiled; extracted executable, README and licenses verified byte-for-byte. Interactive install/uninstall not exercised.",
-  "database_migration": "Existing schema 1 manual correction migrated and reopened under schema 2.",
-  "device_selection": "Native Qt to worker flow tested with mocked Spotify discovery, refresh, selection, confirmed playback, session close and rate-limit cancellation."
+  "database_migration": "Schema 1 manual correction and schema 2 sessions migrated to schema 3. Friend import runs once and preserves removals.",
+  "device_selection": "Native Qt to worker flow tested with mocked Spotify discovery, refresh, selection, confirmed playback, session close and rate-limit cancellation.",
+  "friends_dashboard": "Qt dashboard and worker tests cover two simultaneous profiles, shared observations, Last.fm-only startup, switching without restart, discovery selection, cover and avatar URL parsing, throttling, stale and removed profiles, and verified-position bounds.",
+  "executable_modules": "22 runtime application modules compared against source after compiling with optimization 1."
 }

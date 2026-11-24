@@ -1,11 +1,15 @@
 import sys
+import sqlite3
 import time
 import os
 from pathlib import Path
-from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame, QDialog, QMessageBox, QSystemTrayIcon, QMenu
+from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame, QDialog, QMessageBox, QSystemTrayIcon, QMenu, QTabWidget
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont, QColor, QPainter, QBrush, QIcon, QPixmap, QPen, QFontDatabase
-from lastsync_core.config import DEFAULT_CONFIG as _DEFAULT_CONFIG, load_config, save_config
+from lastsync_core.config import DEFAULT_CONFIG as _DEFAULT_CONFIG, load_config, save_config, data_directory
+from lastsync_core.friends import FriendMonitor, TRACK_FOLLOW, DISCOVERY
+from lastsync_core.storage import MatchStore
+from .friends import FriendsPanel
 from lastsync_core.workers import SyncWorker, AuthWorker, ArtLoader
 from lastsync_core.sync import POLL_ACTIVE, POLL_IDLE
 from .activity import LogPanel
@@ -17,7 +21,7 @@ from .theme import C
 class LastSyncWindow(QMainWindow):
     BTN_R = 25
 
-    def __init__(self, cfg=None, prompt_settings=True):
+    def __init__(self, cfg=None, prompt_settings=True, *, friends_path=None, monitor_factory=FriendMonitor):
         super().__init__()
         config_error = None
         try:
@@ -27,6 +31,17 @@ class LastSyncWindow(QMainWindow):
             config_error = str(error)
         self._sp = self._worker = self._auth_worker = None
         self._device_dialog = None
+        self._monitor_factory, self._monitor = monitor_factory, None
+        self._retired_monitors = set()
+        self._next_session = None
+        self._session_user = self._cfg.get("lastfm_user", "")
+        self._mode, self._picked, self._hint = TRACK_FOLLOW, None, None
+        self._friends_store = None
+        try:
+            self._friends_store = MatchStore(friends_path or data_directory() / "matches.sqlite3")
+            self._friends_store.seed_friends(self._session_user)
+        except (OSError, RuntimeError, sqlite3.Error):
+            config_error = "Could not open the local Friends database."
         self._art_loaders = set()
         self._art_generation = 0
         self._syncing = self._closing = False
@@ -41,10 +56,12 @@ class LastSyncWindow(QMainWindow):
         self._init_fonts()
         self._init_ui()
         self._init_tray()
+        self._configure_monitor()
         if config_error:
             self.set_status(config_error)
+            self.friends.notify(config_error)
             self.log_panel.add_entry(config_error, "error")
-        elif prompt_settings and not self._config_is_complete():
+        elif prompt_settings and not self._cfg.get("lastfm_api_key"):
             QTimer.singleShot(300, self._prompt_settings)
 
     def _init_fonts(self):
@@ -64,9 +81,9 @@ class LastSyncWindow(QMainWindow):
         return QFont(family, size, QFont.Weight.Bold if bold else QFont.Weight.Normal)
 
     def _init_ui(self):
-        self.setWindowTitle("LastSync 1.2")
+        self.setWindowTitle("LastSync 2.0")
         self.setMinimumSize(440, 680)
-        self.resize(440, 680)
+        self.resize(600, 760)
         self.setStyleSheet(f"QMainWindow {{ background-color: {C['bg']}; }} QLabel {{ background: transparent; }}")
 
         # Window icon
@@ -84,7 +101,18 @@ class LastSyncWindow(QMainWindow):
         self.setWindowIcon(QIcon(px))
 
         central = QWidget()
-        self.setCentralWidget(central)
+        self.pages = QTabWidget()
+        self.pages.setStyleSheet("QTabWidget::pane { border: 0; background: #101411; } "
+                                 "QTabBar::tab { padding: 9px 22px; color: #a3aea7; background: #171b18; } "
+                                 "QTabBar::tab:selected { color: white; border-bottom: 2px solid #1db954; }")
+        self.setCentralWidget(self.pages)
+        self.friends = FriendsPanel(self._friends_store, self)
+        self.pages.addTab(self.friends, "Friends")
+        self.pages.addTab(central, "Player")
+        self.friends.roster_changed.connect(self._watch)
+        self.friends.play_requested.connect(self._listen)
+        self.friends.stop_requested.connect(self.stop_sync)
+        self.friends.settings_requested.connect(self._open_settings)
         root = QVBoxLayout(central)
         root.setContentsMargins(24, 24, 24, 18)
         root.setSpacing(0)
@@ -284,7 +312,7 @@ class LastSyncWindow(QMainWindow):
         root.addWidget(self.footer_label)
 
     def _footer_text(self):
-        user = self._cfg.get("lastfm_user", "—")
+        user = self._session_user or "—"
         return f"polls {POLL_ACTIVE}s active · {POLL_IDLE}s idle  ·  last.fm/{user}"
 
     # ── Tray ──
@@ -346,11 +374,11 @@ class LastSyncWindow(QMainWindow):
 
     # ── Config ──
     def _config_is_complete(self):
-        return all(self._cfg.get(k, "").strip() for k in _DEFAULT_CONFIG)
+        return all((self._session_user, self._cfg.get("spotify_client_id"), self._cfg.get("lastfm_api_key")))
 
     def _prompt_settings(self):
         QMessageBox.information(self, "Welcome to LastSync",
-                                "Fill in your credentials in Settings to get started.")
+                                "Enter a Last.fm API key to browse Friends. Spotify playback also needs a Client ID.")
         self._open_settings()
 
     def _open_settings(self):
@@ -368,12 +396,73 @@ class LastSyncWindow(QMainWindow):
             return
         if new["spotify_client_id"] != self._cfg.get("spotify_client_id"):
             self._close_spotify()
+            self.friends.matches.clear()
+        key_changed = new["lastfm_api_key"] != self._cfg.get("lastfm_api_key")
+        if new["lastfm_user"] != self._cfg.get("lastfm_user"):
+            self._session_user = new["lastfm_user"]
         self._cfg = new
+        if self._friends_store and new["lastfm_user"]:
+            self._friends_store.seed_friends(new["lastfm_user"])
+            self.friends.reload()
+        if key_changed:
+            self._configure_monitor()
+        else:
+            self._watch()
         self._refresh_labels()
 
     def _refresh_labels(self):
-        self.sub_label.setText(f"with  {self._cfg.get('lastfm_user', '—')}")
+        self.sub_label.setText(f"with  {self._session_user or '—'}")
         self.footer_label.setText(self._footer_text())
+
+    def _configure_monitor(self):
+        if self._monitor:
+            old, self._monitor = self._monitor, None
+            self._retired_monitors.add(old)
+            old.stop()
+        key = self._cfg.get("lastfm_api_key")
+        if key and self._monitor_factory:
+            self._monitor = self._monitor_factory(key)
+            self._monitor.updated.connect(self._friend_updated)
+            self._monitor.finished.connect(self._monitor_finished)
+            self._watch()
+            self._monitor.start()
+        self.friends.notify("" if key else "Open Settings to connect Last.fm.")
+
+    def _monitor_finished(self):
+        worker = self.sender()
+        self._retired_monitors.discard(worker)
+        if worker is self._monitor:
+            self._monitor = None
+        worker.deleteLater()
+
+    def _watch(self):
+        if self._monitor:
+            focus = self._session_user if self._syncing and self._mode != DISCOVERY else ""
+            self._monitor.watch(self.friends.names(), focus)
+
+    def _friend_updated(self, name):
+        if self._monitor is self.sender() and not self._closing:
+            self.friends.update_activity(name, self._monitor.activity(name))
+
+    def _listen(self, username, mode, picked, hint):
+        request = (username, mode, picked, hint)
+        if self._worker or self._auth_worker:
+            self.stop_sync()
+            self._next_session = request
+            self.set_status(f"Switching to {username}")
+            return
+        self._start_request(request)
+
+    def _start_request(self, request):
+        self._session_user, self._mode, self._picked, self._hint = request
+        self._refresh_labels()
+        self.pages.setCurrentIndex(1)
+        self.start_sync()
+
+    def _resume_switch(self):
+        if self._next_session and not (self._worker or self._auth_worker or self._closing):
+            request, self._next_session = self._next_session, None
+            self._start_request(request)
 
     # ── Progress ──
     def _tick_progress(self):
@@ -401,10 +490,16 @@ class LastSyncWindow(QMainWindow):
     def start_sync(self):
         if self._worker or self._auth_worker or self._closing:
             return
+        if not self._session_user:
+            self.pages.setCurrentIndex(0)
+            self.friends.notify("Choose a friend to start listening.")
+            return
         if not self._config_is_complete():
             self._prompt_settings()
             return
         self._syncing = True
+        self.friends.stop_button.setEnabled(True)
+        self._watch()
         self.sync_btn.setText("CANCEL CONNECT")
         self.sync_btn.setEnabled(True)
         self._btn_stop()
@@ -451,8 +546,10 @@ class LastSyncWindow(QMainWindow):
         self.sync_btn.setEnabled(True)
         self._btn_stop()
         self.set_status("Connected; polling Last.fm")
-        self.log_panel.add_entry("Track Follow started; source position unknown", "info")
-        worker = SyncWorker(self._sp, self._cfg)
+        self.log_panel.add_entry(f"{self._mode} · {self._session_user}", "info")
+        self.live_badge.setText(self._mode.upper())
+        worker = SyncWorker(self._sp, {**self._cfg, "lastfm_user": self._session_user}, monitor=self._monitor,
+                            mode=self._mode, picked=self._picked, hint=self._hint)
         self._worker = worker
         worker.track_changed.connect(self._on_track)
         worker.status_changed.connect(self._on_status)
@@ -472,6 +569,7 @@ class LastSyncWindow(QMainWindow):
             worker.deleteLater()
         if not self._syncing:
             self._reset_button()
+        self._resume_switch()
 
     def _sync_finished(self):
         worker = self._worker
@@ -479,14 +577,18 @@ class LastSyncWindow(QMainWindow):
         self._syncing = False
         self._tick_timer.stop()
         self._progress_snapshot = None
-        self._close_spotify()
+        if not self._next_session:
+            self._close_spotify()
         self.live_badge.hide()
         self.match_btn.hide()
         if worker:
             worker.deleteLater()
         self._reset_button()
+        self._resume_switch()
 
     def _reset_button(self):
+        self.friends.stop_button.setEnabled(False)
+        self._watch()
         self.pulse.set_active(False)
         self.sync_btn.setEnabled(not self._closing)
         self.sync_btn.setText("START SYNC")
@@ -501,8 +603,11 @@ class LastSyncWindow(QMainWindow):
         self.log_panel.add_entry(msg, "auth")
 
     def stop_sync(self):
+        self._next_session = None
         self._dismiss_devices()
         self._syncing = False
+        self.friends.stop_button.setEnabled(False)
+        self._watch()
         self._tick_timer.stop()
         self.pulse.set_active(False)
         self.live_badge.hide()
@@ -577,13 +682,16 @@ class LastSyncWindow(QMainWindow):
             return
         self._progress_snapshot = playback
         self.duration_lbl.setText(self._ms(playback.duration_ms) if playback.duration_ms else "")
-        self.elapsed_lbl.setToolTip("Your Spotify playback position; the source position is unknown")
+        self.elapsed_lbl.setToolTip("Position reported by your Spotify player")
         self._tick_progress()
 
     def _on_state(self, state, message):
         if not self._syncing:
             return
         self._state = state
+        if self._match_request and state in ("FOLLOWING", "RESOLVING", "STARTING", "RECOVERING"):
+            status = "Confirmed on your Spotify device" if state == "FOLLOWING" else message
+            self.friends.set_match(self._session_user, self._match_request[1], status)
         self.live_badge.setVisible(state == "FOLLOWING")
         self.set_status(message)
         self.log_panel.add_entry(f"{state}: {message}", "error" if state == "STOPPED" else "info")
@@ -609,9 +717,10 @@ class LastSyncWindow(QMainWindow):
         if self._match_request is None or self._worker is None:
             return
         event_id, source, candidates = self._match_request
+        worker = self._worker
         dialog = MatchDialog(source, candidates, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted and self._worker:
-            self._worker.choose_match(event_id, dialog.uri())
+        if dialog.exec() == QDialog.DialogCode.Accepted and self._worker is worker and self._syncing:
+            worker.choose_match(event_id, dialog.uri())
 
     def _on_status(self, message, level):
         if self._syncing:
@@ -639,16 +748,23 @@ class LastSyncWindow(QMainWindow):
         if self._closing:
             return
         self._closing = True
+        self.friends.shutdown()
+        if self._monitor:
+            self._monitor.stop()
         self.stop_sync()
         self.set_status("Closing background services")
         self._finish_shutdown()
 
     def _finish_shutdown(self):
-        workers = [self._worker, self._auth_worker, *self._art_loaders]
+        workers = [self._worker, self._auth_worker, self._monitor, *self._retired_monitors,
+                   *self._art_loaders, *self.friends.loaders.values()]
         if any(worker and worker.isRunning() for worker in workers):
             QTimer.singleShot(100, self._finish_shutdown)
             return
         self._close_spotify()
+        if self._friends_store:
+            self._friends_store.close()
+            self._friends_store = None
         self._tray.hide()
         QApplication.instance().quit()
 

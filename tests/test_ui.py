@@ -28,10 +28,11 @@ class NativeUiTests(unittest.TestCase):
 
     def setUp(self):
         self.window = lastsync.LastSyncWindow({"lastfm_user": "friend", "lastfm_api_key": "test",
-                                              "spotify_client_id": "test"}, prompt_settings=False)
+                                              "spotify_client_id": "test"}, prompt_settings=False, friends_path=":memory:", monitor_factory=None)
 
     def tearDown(self):
         self.window._worker = self.window._auth_worker = None
+        self.window._friends_store.close()
         self.window._closing = True
         self.window._tray.hide()
         self.window.close()
@@ -43,7 +44,7 @@ class NativeUiTests(unittest.TestCase):
         self.app.processEvents()
         pixmap = self.window.grab()
         self.assertFalse(pixmap.isNull())
-        self.assertEqual(self.window.windowTitle(), "LastSync 1.2")
+        self.assertEqual(self.window.windowTitle(), "LastSync 2.0")
         self.assertGreaterEqual(self.window.width(), 440)
 
     def test_settings_masks_api_key_and_needs_no_client_secret(self):

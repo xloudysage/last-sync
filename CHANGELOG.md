@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.0.0 - 2026-11-24
+
+- Add a native Friends dashboard with persistent ordering, search, add/remove, available avatars and album artwork.
+- Share a bounded Last.fm polling scheduler between the roster and player. Show observed activity, scrobble time, match status and stale/error states.
+- Add Best-Effort Sync with a fresh user-supplied source position and explicit one-track Discovery playback.
+- Switch friends and modes while running. Existing account settings, mappings and sessions migrate forward.
+- Allow Last.fm-only dashboard use before connecting Spotify.
+
 ## 1.2.0 - 2026-11-24
 
 - Choose an available Spotify output after authorization. Refresh and cancellation run without blocking the interface.

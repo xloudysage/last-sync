@@ -20,7 +20,7 @@ def main(argv=None):
     app = QApplication(argv)
     app.setStyle("Fusion")
     app.setQuitOnLastWindowClosed(False)
-    window = LastSyncWindow(dict(_DEFAULT_CONFIG), prompt_settings=False) if check else LastSyncWindow()
+    window = LastSyncWindow(dict(_DEFAULT_CONFIG), prompt_settings=False, friends_path=":memory:") if check else LastSyncWindow()
     window.show()
     if check:
         app.processEvents()

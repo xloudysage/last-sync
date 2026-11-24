@@ -37,7 +37,7 @@ class ReleaseStorageTests(unittest.TestCase):
         store = self.open()
         self.assertTrue(store.get(track).manual)
         self.assertEqual(store.get(track).selected.uri, candidate["uri"])
-        self.assertEqual(store.db.execute("PRAGMA user_version").fetchone(), (2,))
+        self.assertEqual(store.db.execute("PRAGMA user_version").fetchone(), (3,))
         self.assertEqual(self.open("other").get(track), None)
 
     def test_session_isolation_idempotent_end_and_incomplete_runs(self):

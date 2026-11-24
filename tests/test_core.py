@@ -432,7 +432,7 @@ class PersistenceTests(unittest.TestCase):
             store = MatchStore(path, "user-a")
             resolver = TrackResolver(FakeSpotify(Clock()), store)
             resolver.correct(A, URI_A)
-            self.assertEqual(store.db.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(store.db.execute("PRAGMA user_version").fetchone()[0], 3)
             store.close()
             store = MatchStore(path, "user-a")
             self.assertTrue(store.get(A).manual)

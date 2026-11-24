@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import unicodedata
 import re
@@ -16,6 +16,7 @@ class Track:
     album: str = ""
     duration_ms: int | None = None
     isrc: str = ""
+    artwork: str = field(default="", compare=False)
 
     @property
     def key(self):

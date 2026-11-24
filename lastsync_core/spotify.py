@@ -115,10 +115,9 @@ class SpotifyClient:
                 return device.id
         return None
 
-    def start(self, uri, device_id):
-        # Last.fm supplies no reliable live position. Track Follow starts at zero.
+    def start(self, uri, device_id, position_ms=0):
         self.request("PUT", "me/player/play", params={"device_id": device_id},
-                     json={"uris": [uri], "position_ms": 0})
+                     json={"uris": [uri], "position_ms": position_ms})
 
     def close(self):
         self.client.close()
