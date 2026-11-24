@@ -59,6 +59,15 @@ class Resolution:
 
 
 @dataclass(frozen=True)
+class Device:
+    id: str
+    name: str
+    type: str
+    active: bool
+    restricted: bool
+
+
+@dataclass(frozen=True)
 class Playback:
     uri: str
     position_ms: int

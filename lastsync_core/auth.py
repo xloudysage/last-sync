@@ -11,7 +11,7 @@ import webbrowser
 
 import httpx
 
-from .api import request_json
+from .transport import request_json
 from .config import SecretStore
 from .errors import ServiceError
 

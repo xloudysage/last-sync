@@ -1,0 +1,60 @@
+"""Last.fm reported listening activity."""
+import time
+
+import httpx
+
+from .errors import ServiceError
+from .models import Observation, Scrobble, Track
+from .transport import request_json
+
+
+def text(value):
+    return value.get("#text", value.get("name", "")) if isinstance(value, dict) else str(value or "")
+
+
+def parse_recent(payload, observed_at):
+    if not isinstance(payload, dict):
+        raise ServiceError("Last.fm", "Last.fm: malformed recent-tracks response")
+    if "error" in payload:
+        code = str(payload["error"])
+        raise ServiceError("Last.fm", {
+            "6": "Last.fm: username not found or invalid request",
+            "10": "Last.fm: invalid API key",
+            "26": "Last.fm: API key suspended",
+            "29": "Last.fm: rate limited",
+        }.get(code, "Last.fm: service temporarily unavailable"),
+            fatal=code in ("6", "10", "26"), retry_after=30 if code == "29" else 0)
+    try:
+        rows = payload["recenttracks"]["track"]
+        if isinstance(rows, dict):
+            rows = [rows]
+        if not isinstance(rows, list):
+            raise TypeError
+        current, history = None, []
+        for row in rows:
+            track = Track(str(row["name"]), text(row["artist"]), text(row.get("album", "")))
+            if not track.title.strip() or not track.artist.strip():
+                raise ValueError
+            if str(row.get("@attr", {}).get("nowplaying", "")).casefold() == "true":
+                if current is None:
+                    current = track
+            elif row.get("date", {}).get("uts") is not None:
+                history.append(Scrobble(track, int(row["date"]["uts"])))
+        return Observation(current, tuple(history), observed_at)
+    except (KeyError, ValueError, TypeError, AttributeError):
+        raise ServiceError("Last.fm", "Last.fm: malformed recent-tracks response") from None
+
+
+class LastFMClient:
+    def __init__(self, api_key, client=None):
+        self.api_key = api_key
+        self.client = client or httpx.Client()
+
+    def recent(self, username):
+        payload = request_json(self.client, "Last.fm", "GET", "https://ws.audioscrobbler.com/2.0/",
+                               params={"method": "user.getrecenttracks", "user": username,
+                                       "api_key": self.api_key, "format": "json", "limit": 5})
+        return parse_recent(payload, time.time())
+
+    def close(self):
+        self.client.close()

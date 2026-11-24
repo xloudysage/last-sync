@@ -1,4 +1,6 @@
-# Existing-code audit and validation
+# Version 1.1 audit and validation
+
+This is the historical stabilization audit. For the current release, see [the README](../README.md) and [validation results](VALIDATION.json).
 
 ## Inspection and architecture
 

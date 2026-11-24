@@ -1,0 +1,1 @@
+"""Native LastSync desktop interface."""

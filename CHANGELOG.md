@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.0 - 2026-11-24
+
+- Choose an available Spotify output after authorization. Refresh and cancellation run without blocking the interface.
+- Require playback confirmation on the requested device. Retry a new source event when its selected device returns.
+- Preserve existing match corrections while adding account-scoped profiles, session summaries and a bounded ten-minute catalog response cache.
+- Separate the native window, widgets, dialogs and activity panel from the launcher. Split service clients and shared transport, and add rotating lifecycle diagnostics.
+- Ship a per-user Windows installer and a portable Windows ZIP.
+
 ## 1.1.0 — 2026-11-24
 
 - Preserve the supplied PyQt6 window, artwork widget, activity panel, theme and tray workflow.
@@ -24,5 +32,5 @@ PKCE, secure configuration and a small service split were brought forward from 1
 ## Roadmap status
 
 - 1.1: implemented and verified locally; real-account acceptance checks remain.
-- 1.2: foundations present; device selector, broader persistence and further UI separation remain.
+- 1.2: device selection, modular architecture, session storage and catalog caching implemented.
 - 2.0–3.0: not implemented in this milestone. No Friends dashboard, Music DNA, collections, historical analytics or cooperative protocol is claimed.

@@ -43,7 +43,7 @@ class NativeUiTests(unittest.TestCase):
         self.app.processEvents()
         pixmap = self.window.grab()
         self.assertFalse(pixmap.isNull())
-        self.assertEqual(self.window.windowTitle(), "LastSync 1.1")
+        self.assertEqual(self.window.windowTitle(), "LastSync 1.2")
         self.assertGreaterEqual(self.window.width(), 440)
 
     def test_settings_masks_api_key_and_needs_no_client_secret(self):
@@ -178,6 +178,92 @@ class NativeUiTests(unittest.TestCase):
         self.assertEqual(auth.connections, 2)
         self.assertIsNone(auth.token)
         self.assertEqual(successes, [spotify])
+        worker.deleteLater()
+
+    def test_device_picker_refresh_then_play_on_selected_output(self):
+        import sqlite3
+        from unittest.mock import Mock
+        from PyQt6.QtCore import QThread, Qt
+        from PyQt6.QtTest import QTest
+        from lastsync_core import workers
+        from lastsync_core.models import Device, Observation
+
+        source = Track("Song", "Artist")
+        candidate = Candidate("spotify:track:" + "s" * 22, source)
+        fetch_threads = []
+        spotify = Mock(preferred_device=None)
+        spotify.request.return_value = {"id": "test-account"}
+        def devices():
+            fetch_threads.append(QThread.currentThread())
+            if len(fetch_threads) == 1:
+                return []
+            return [Device("locked", "TV", "TV", True, True),
+                    Device("desk", "Office", "Computer", False, False)]
+        spotify.devices.side_effect = devices
+        spotify.search.return_value = [candidate]
+        spotify.active_device.side_effect = lambda: spotify.preferred_device
+        spotify.playback.return_value = Playback(candidate.uri, 0, 10000, True, "desk", 0)
+        lastfm = Mock()
+        lastfm.recent.return_value = Observation(source, (), 100)
+
+        def wait_for(predicate):
+            deadline = time.monotonic() + 5
+            while not predicate() and time.monotonic() < deadline:
+                QTest.qWait(10)
+            self.assertTrue(predicate())
+
+        with tempfile.TemporaryDirectory() as folder, \
+             patch.object(workers, "SpotifyClient", return_value=spotify), \
+             patch.object(workers, "SpotifyAuth"), \
+             patch.object(workers, "LastFMClient", return_value=lastfm), \
+             patch.object(workers, "data_directory", return_value=Path(folder)), \
+             patch.object(workers, "CONFIG_FILE", Path(folder) / "config"):
+            self.window.start_sync()
+            try:
+                wait_for(lambda: self.window._device_dialog is not None)
+                dialog = self.window._device_dialog
+                self.assertEqual(dialog.items.count(), 1)
+                dialog.refresh.click()
+                wait_for(lambda: dialog.items.count() == 3)
+                self.assertFalse(dialog.items.item(1).flags() & Qt.ItemFlag.ItemIsEnabled)
+                self.assertTrue(all(t != self.app.thread() for t in fetch_threads))
+                spotify.start.assert_not_called()
+                dialog.items.setCurrentRow(2)
+                dialog.follow.click()
+                wait_for(lambda: self.window._state == "FOLLOWING")
+                spotify.start.assert_called_once_with(candidate.uri, "desk")
+            finally:
+                self.window.stop_sync()
+                wait_for(lambda: self.window._auth_worker is None and self.window._worker is None)
+            with sqlite3.connect(Path(folder) / "matches.sqlite3") as db:
+                self.assertEqual(db.execute("SELECT device_mode,confirmed_starts,outcome FROM sessions").fetchone(),
+                                 ("selected", 1, "stopped"))
+            db.close()
+
+    def test_cancel_during_device_rate_limit_wakes_worker(self):
+        from unittest.mock import Mock
+        from PyQt6.QtTest import QSignalSpy
+        from lastsync_core import workers
+        from lastsync_core.errors import ServiceError
+        worker = workers.AuthWorker(self.window._cfg, choose_output=True)
+        spotify = Mock()
+        spotify.request.return_value = {"id": "id"}
+        spotify.devices.side_effect = ServiceError("Spotify", "rate limited", retry_after=60)
+        with tempfile.TemporaryDirectory() as folder, \
+             patch.object(workers, "SpotifyAuth"), patch.object(workers, "SpotifyClient", return_value=spotify), \
+             patch.object(workers, "CONFIG_FILE", Path(folder) / "config"):
+            ready = QSignalSpy(worker.device_options)
+            done = QSignalSpy(worker.finished)
+            success = QSignalSpy(worker.auth_success)
+            worker.start()
+            try:
+                self.assertTrue(ready.wait(3000))
+                self.assertIsNone(ready[0][0])
+            finally:
+                worker.stop()
+                self.assertTrue(done.wait(2000) or len(done))
+            self.assertFalse(len(success))
+            spotify.close.assert_called_once()
         worker.deleteLater()
 
 

@@ -304,6 +304,29 @@ class EngineTests(unittest.TestCase):
         self.engine.step()
         self.assertEqual(len(self.sp.starts), 1)
 
+    def test_confirmation_requires_the_requested_device(self):
+        self.engine.step()
+        self.sp.current = Playback(URI_A, 300, 180000, True, "other-device", 0)
+        self.engine.step()
+        self.assertEqual(self.engine.state, SyncState.STARTING)
+        self.clock.now = 11
+        self.engine.step()
+        self.assertEqual(self.engine.state, SyncState.STOPPED)
+        self.assertEqual(len(self.sp.starts), 1)
+
+    def test_new_track_waits_for_device_then_starts_once(self):
+        self.follow()
+        self.sp.device = None
+        self.lfm.observation = Observation(B, (), 110)
+        self.engine.step()
+        self.engine.step()
+        self.assertEqual(self.engine.state, SyncState.RECOVERING)
+        self.sp.device = "device-1"
+        self.engine.step()
+        self.engine.step()
+        self.assertEqual(self.sp.starts, [(URI_A, "device-1"), (URI_B, "device-1")])
+        self.assertEqual(self.engine.state, SyncState.FOLLOWING)
+
     def test_manual_track_change_stops_following(self):
         self.follow()
         self.sp.current = Playback(URI_B, 100, 210000, True, "device-1", 0)
@@ -409,7 +432,7 @@ class PersistenceTests(unittest.TestCase):
             store = MatchStore(path, "user-a")
             resolver = TrackResolver(FakeSpotify(Clock()), store)
             resolver.correct(A, URI_A)
-            self.assertEqual(store.db.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(store.db.execute("PRAGMA user_version").fetchone()[0], 2)
             store.close()
             store = MatchStore(path, "user-a")
             self.assertTrue(store.get(A).manual)

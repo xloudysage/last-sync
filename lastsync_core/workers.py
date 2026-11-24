@@ -1,11 +1,13 @@
 import hashlib
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 import threading
 
 import httpx
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from .api import LastFMClient, SpotifyClient, TIMEOUT
+from .lastfm import LastFMClient
+from .spotify import SpotifyClient
+from .transport import TIMEOUT
 from .auth import SpotifyAuth
 from .config import CONFIG_FILE, data_directory
 from .errors import ServiceError
@@ -13,6 +15,7 @@ from .matching import TrackResolver
 from .models import SyncState
 from .storage import MatchStore
 from .sync import SyncEngine
+from .diagnostics import log
 
 
 class SyncWorker(QThread):
@@ -40,12 +43,18 @@ class SyncWorker(QThread):
 
     def run(self):
         lastfm = store = None
+        session = None
+        outcome = "failed"
         try:
             lastfm = LastFMClient(self.cfg["lastfm_api_key"])
             namespace = getattr(self.sp, "namespace", self.cfg["spotify_client_id"])
             store = MatchStore(data_directory() / "matches.sqlite3", namespace)
+            self.sp.catalog_cache = store
+            session = store.begin_session(self.cfg["lastfm_user"], getattr(self.sp, "preferred_device", None))
+            log.info("Session started")
 
             def report_track(source, candidate):
+                store.record_start(session)
                 self.track_changed.emit(source.title, source.artist, 0,
                                         candidate.track.duration_ms or 0, candidate.artwork)
 
@@ -80,27 +89,75 @@ class SyncWorker(QThread):
                     self._stop_event.wait(delay)
             if self._stop_event.is_set():
                 engine.stop()
+                outcome = "stopped"
+            else:
+                outcome = engine.message
         except Exception:
+            log.error("Sync worker failed")
             # Never send raw transport/SQLite exceptions containing credentials or local paths to UI logs.
             self.state_changed.emit("STOPPED", "Local sync service failed; check installation and data-directory permissions")
         finally:
             if lastfm:
                 lastfm.close()
             if store:
-                store.close()
+                self.sp.catalog_cache = None
+                try:
+                    if session is not None:
+                        store.end_session(session, outcome)
+                    log.info("Session closed")
+                except Exception:
+                    log.error("Session close could not be recorded")
+                    self.status_changed.emit("Could not save session end to local history", "error")
+                finally:
+                    store.close()
 
 
 class AuthWorker(QThread):
     auth_success = pyqtSignal(object)
     auth_failed = pyqtSignal(str)
+    device_options = pyqtSignal(object, str)
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, *, choose_output=False):
         super().__init__()
         self.cfg = dict(cfg)
         self._cancelled = threading.Event()
+        self.choose_output = choose_output
+        self._device_commands = Queue(maxsize=1)
+
+    def device_command(self, action, device_id=None):
+        try:
+            self._device_commands.put_nowait((action, device_id))
+        except Full:
+            pass
 
     def stop(self):
         self._cancelled.set()
+        self.device_command("cancel")
+
+    def _choose_device(self, sp):
+        while not self._cancelled.is_set():
+            try:
+                devices = sp.devices()
+                message = "" if devices else "Open Spotify on the device you want, then refresh."
+            except ServiceError as error:
+                if error.fatal:
+                    raise
+                devices = []
+                message = str(error)
+                if error.retry_after > 0:
+                    self.device_options.emit(None, f"Spotify asked us to wait {error.retry_after:g}s.")
+                    if self._cancelled.wait(error.retry_after):
+                        return False
+                    continue
+            self.device_options.emit(devices, message)
+            action, device_id = self._device_commands.get()
+            if self._cancelled.is_set() or action == "cancel":
+                return False
+            if action == "select" and (device_id is None or any(
+                    d.id and d.id == device_id and not d.restricted for d in devices)):
+                sp.preferred_device = device_id
+                return True
+        return False
 
     def run(self):
         auth = sp = None
@@ -130,6 +187,8 @@ class AuthWorker(QThread):
             legacy = CONFIG_FILE.parent / ".lastsync_spotify_cache"
             if legacy.exists():
                 legacy.unlink()
+            if self.choose_output and not self._choose_device(sp):
+                return
             handed_off = True
             self.auth_success.emit(sp)
         except (ServiceError, PermissionError, TimeoutError) as error:

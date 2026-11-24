@@ -1,5 +1,5 @@
 #define MyAppName "LastSync"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.2.0"
 
 [Setup]
 AppId={{2AE51E28-7F79-4A2F-B0C8-3C401C26715C}
@@ -10,9 +10,10 @@ DefaultDirName={localappdata}\Programs\LastSync
 DefaultGroupName=LastSync
 PrivilegesRequired=lowest
 OutputDir=..\dist
-OutputBaseFilename=LastSync-1.1-Setup
+OutputBaseFilename=LastSync-1.2.0-Setup
 Compression=lzma2
 SolidCompression=yes
+ArchitecturesAllowed=x64compatible
 WizardStyle=modern
 LicenseFile=..\LICENSE
 UninstallDisplayIcon={app}\LastSync.exe
@@ -21,6 +22,8 @@ UninstallDisplayIcon={app}\LastSync.exe
 Source: "..\dist\LastSync.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+
+Source: "..\docs\third-party-licenses\*"; DestDir: "{app}\third-party-licenses"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\LastSync"; Filename: "{app}\LastSync.exe"

@@ -20,6 +20,7 @@ class SyncEngine:
         self.retry = RetryPolicy()
         self.source = self.resolution = self.pending = self.owned = None
         self.event_id = 0
+        self.confirmed_event = None
         self.first_observed_at = 0
         self.last_scrobble = None
         self.no_match_until = 0
@@ -96,9 +97,10 @@ class SyncEngine:
                 self.on_match(self.event_id, self.source, ())  # Invalidate stale correction dialogs.
             if self.pending:
                 candidate, device, sent_at = self.pending
-                if playback and playback.uri == candidate.uri and playback.playing:
+                if playback and playback.uri == candidate.uri and playback.playing and playback.device_id == device:
                     self.pending = None
-                    self.owned = (candidate.uri, playback.device_id or device)
+                    self.owned = (candidate.uri, device)
+                    self.confirmed_event = self.event_id
                     self.transition(SyncState.FOLLOWING, "Following track; source position unknown")
                     self.on_track(self.source, candidate)
                     self.on_progress(playback)
@@ -108,7 +110,7 @@ class SyncEngine:
                 else:
                     self.transition(SyncState.STARTING, "Waiting for Spotify playback confirmation")
                 return POLL_ACTIVE
-            if not changed and self.resolution and self.resolution.selected and self.owned:
+            if self.confirmed_event == self.event_id and self.owned:
                 if playback and playback.uri == self.owned[0]:
                     self.transition(SyncState.FOLLOWING, "Following track; source position unknown")
                     self.on_progress(playback)
@@ -129,7 +131,10 @@ class SyncEngine:
             if self.cancelled():
                 return POLL_IDLE
             if not device:
-                self.transition(SyncState.RECOVERING, "Open Spotify and play once to activate a device")
+                message = ("Selected output is unavailable. Reconnect it or stop to choose another."
+                           if getattr(self.spotify, "preferred_device", None) else
+                           "Open Spotify and play once to activate a device")
+                self.transition(SyncState.RECOVERING, message)
                 return POLL_IDLE
             candidate = self.resolution.selected
             self.transition(SyncState.STARTING, "Starting matched track from the beginning")

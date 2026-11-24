@@ -15,17 +15,82 @@ class MatchStore:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path, timeout=5)
         self.clock, self.namespace = clock, namespace
-        version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version > 1:
+        try:
+            self.db.execute("PRAGMA foreign_keys=ON")
+            self._migrate()
+        except Exception:
             self.db.close()
-            raise RuntimeError("Match database is newer than this application")
+            raise
+
+    def _migrate(self):
         with self.db:
+            # Serialize schema discovery as well as updates across app instances.
+            self.db.execute("BEGIN IMMEDIATE")
+            version = self.db.execute("PRAGMA user_version").fetchone()[0]
+            if version > 2:
+                raise RuntimeError("Match database is newer than this application")
             if version < 1:
                 self.db.execute("""CREATE TABLE matches (
                     namespace TEXT NOT NULL, source TEXT NOT NULL, candidate TEXT,
                     confidence REAL NOT NULL, manual INTEGER NOT NULL, expires REAL NOT NULL,
                     PRIMARY KEY(namespace, source))""")
-                self.db.execute("PRAGMA user_version=1")
+            if version < 2:
+                self.db.execute("""CREATE TABLE profiles (
+                    id INTEGER PRIMARY KEY, namespace TEXT NOT NULL, user_key TEXT NOT NULL,
+                    username TEXT NOT NULL, UNIQUE(namespace, user_key))""")
+                self.db.execute("""CREATE TABLE sessions (
+                    id INTEGER PRIMARY KEY, profile_id INTEGER NOT NULL REFERENCES profiles(id),
+                    started_at REAL NOT NULL, ended_at REAL, outcome TEXT, confirmed_starts INTEGER NOT NULL DEFAULT 0,
+                    device_mode TEXT NOT NULL CHECK(device_mode IN ('selected','active')))""")
+                self.db.execute("CREATE INDEX sessions_profile_time ON sessions(profile_id, started_at)")
+                self.db.execute("""CREATE TABLE search_cache (
+                    namespace TEXT NOT NULL, query TEXT NOT NULL, response TEXT NOT NULL,
+                    expires REAL NOT NULL, PRIMARY KEY(namespace, query))""")
+                self.db.execute("CREATE INDEX search_expiry ON search_cache(expires)")
+                self.db.execute("PRAGMA user_version=2")
+
+    def begin_session(self, username, selected_device):
+        username = username.strip()
+        with self.db:
+            profile_id = self.db.execute("""INSERT INTO profiles(namespace,user_key,username)
+                VALUES (?,?,?) ON CONFLICT(namespace,user_key) DO UPDATE SET username=excluded.username
+                RETURNING id""", (self.namespace, username.casefold(), username)).fetchone()[0]
+            return self.db.execute("""INSERT INTO sessions(profile_id,started_at,device_mode)
+                VALUES (?,?,?)""", (profile_id, self.clock(), "selected" if selected_device else "active")).lastrowid
+
+    def record_start(self, session):
+        with self.db:
+            self.db.execute("UPDATE sessions SET confirmed_starts=confirmed_starts+1 WHERE id=? AND ended_at IS NULL",
+                            (session,))
+
+    def end_session(self, session, outcome):
+        with self.db:
+            self.db.execute("UPDATE sessions SET ended_at=max(started_at,?),outcome=? WHERE id=? AND ended_at IS NULL",
+                            (self.clock(), outcome, session))
+
+    def cached_search(self, query):
+        row = self.db.execute("SELECT response FROM search_cache WHERE namespace=? AND query=? AND expires>?",
+                              (self.namespace, query, self.clock())).fetchone()
+        if row:
+            try:
+                value = json.loads(row[0])
+                if isinstance(value["tracks"]["items"], list):
+                    return value
+            except (ValueError, TypeError, KeyError):
+                pass
+        return None
+
+    def cache_search(self, query, response):
+        payload = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+        if len(payload.encode("utf-8")) > 256 * 1024:
+            return
+        now = self.clock()
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO search_cache VALUES (?,?,?,?)",
+                            (self.namespace, query, payload, now + 600))
+            self.db.execute("DELETE FROM search_cache WHERE expires<=?", (now,))
+            self.db.execute("""DELETE FROM search_cache WHERE rowid IN
+                (SELECT rowid FROM search_cache ORDER BY expires DESC,rowid DESC LIMIT -1 OFFSET 256)""")
 
     @staticmethod
     def source_key(track):
