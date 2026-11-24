@@ -1,219 +1,100 @@
----
+# LastSync 1.1
 
-# LastSync
+A native Windows companion that follows a public Last.fm user's reported current track on your authorized Spotify account.
 
-Listen along with your friends.
+This release repairs the supplied application before the larger LastSync 2.0 expansion. It preserves the native PyQt6 interface and tray workflow. It implements **Track Follow**: Last.fm does not provide a reliable live position, so a newly detected listening event starts at the beginning on your Spotify.
 
-LastSync is a desktop app that automatically plays whatever someone is listening to on Last.fm — on your Spotify — in near real time.
+## Requirements
 
-No manual searching. No switching tracks yourself. Just press start.
+- Windows 11; Python 3.12+ when running from source.
+- Spotify Premium for playback control and a developer app authorized for your account.
+- Development Mode currently requires the app owner to have Premium and allows up to five authorized users.
+- Spotify open on an active, unrestricted playback device. Play a track once to activate it.
+- A Last.fm API key and public now-playing visibility for the source profile.
 
----
+## Run
 
-## What this is for
+For a portable package containing `LastSync.exe`, extract the whole package and double-click the executable. Python is not needed for that executable.
 
-If you’ve ever wanted to:
+From source, use an installed Python 3.12+ interpreter, for example:
 
-* listen to the exact same music as a friend
-* follow someone’s music taste live
-* or just passively vibe with what someone is playing
-
-This app does that automatically.
-
----
-
-## How it works (simple)
-
-* You enter someone’s Last.fm username
-* The app checks what they’re currently playing
-* When they play a song → your Spotify plays the same song
-* It even jumps to roughly the same timestamp
-
-That’s it.
-
----
-
-## What you need before starting
-
-You only need to set this up once.
-
-### 1. Spotify (required)
-
-* You must have a Spotify account
-* Spotify must be open on your device (phone, desktop, or browser)
-
----
-
-### 2. Last.fm API key (free)
-
-Get it here: [https://www.last.fm/api/account/create](https://www.last.fm/api/account/create)
-
-* Fill the form (anything works)
-* Copy the API key
-
----
-
-### 3. Spotify Developer App (free)
-
-Go here: [https://developer.spotify.com/dashboard](https://developer.spotify.com/dashboard)
-
-Steps:
-
-1. Click **Create App**
-2. Name it anything
-3. Add this EXACT redirect URI:
-
-   ```
-   http://127.0.0.1:8888/callback
-   ```
-4. Save
-5. Copy:
-
-   * Client ID
-   * Client Secret
-
----
-
-## Installation
-
-### Step 1 — Download / clone
-
-```bash
-git clone https://github.com/YOURUSERNAME/LastSync.git
-cd LastSync
+```powershell
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe lastsync.py
 ```
 
----
+Alternatively, `python -m pip install .` installs the `lastsync` launcher. The `.env.example` file is documentation; the application does not load `.env` files.
 
-### Step 2 — Install dependencies
+## Connect
 
-```bash
-pip install pyqt6 spotipy requests
+1. Create a [Last.fm API key](https://www.last.fm/api/account/create).
+2. Create an app in the [Spotify developer dashboard](https://developer.spotify.com/dashboard).
+3. Register exactly `http://127.0.0.1:8888/callback` as a redirect URI.
+4. In Settings, enter the source Last.fm username, API key and Spotify **Client ID**. A client secret is no longer needed.
+5. Open Spotify, play once, then click **Start Sync** and authorize in your system browser.
+
+PKCE authorization checks a random state, binds only to loopback and expires after three minutes. Cancel interrupts the listener. Port 8888 must be available. HTTP requests have bounded timeouts.
+
+## Following and matching
+
+- New reported tracks are ranked by title, artist and recording version. Duration and ISRC contribute when supplied; missing data is not fabricated.
+- Unambiguous high-confidence matches start from zero on your active device. Following is displayed only after Spotify confirms playback.
+- Same-song repeats count as new events when an idle boundary or a newer same-track scrobble supplies evidence. An uninterrupted identical now-playing record without new evidence cannot reveal a repeat; LastSync does not guess from duration.
+- Unavailable or ambiguous matches leave playback unchanged. **Choose Spotify Match** selects a candidate or accepts a pasted Spotify track link. Your explicit choice is saved for this source recording and Spotify account.
+- A manual Spotify pause, track change or device switch stops following. Press Start to opt back in.
+- Device loss does not restart the current recording. A future source event can start after a device becomes active again.
+- Stop ends LastSync control and leaves Spotify playing. An already-sent command cannot be recalled.
+
+The progress bar describes **your Spotify playback**, never an estimated source position. It uses observed snapshots, briefly interpolates with a monotonic clock and marks data stale after ten seconds without an update. Match confidence is a metadata score, not a calibrated probability; a manual correction is a user decision.
+
+## Desktop behavior
+
+Closing hides to the tray when available. Use **Show LastSync** to restore it and **Quit** to cancel workers and exit after in-flight requests finish. Enter toggles Start/Stop. Stop the session before changing Settings. Network operations run outside the GUI thread. Artwork downloads are bounded and stale responses are ignored.
+
+## Data and migration
+
+`~/.lastsync_config.json` holds the source username and public Client ID. On Windows, Last.fm keys and Spotify tokens use Windows Credential Manager under `LastSync/` entries. Other platforms require Python keyring with an OS backend. There is no plaintext credential fallback.
+
+Legacy configuration is migrated on load: the Last.fm key is verified in credential storage before secret fields are removed from JSON. The obsolete client secret is no longer used. The legacy `.lastsync_spotify_cache` is removed after successful PKCE authorization; expect to authorize once again. Failed migration preserves the original configuration and displays an error.
+
+Mappings live in `%LOCALAPPDATA%/LastSync/matches.sqlite3` on Windows. Automatic mappings expire after 30 days; negative mappings after five minutes. The automatic cache is bounded to 5,000 records. Manual corrections last up to ten years. Mappings are isolated by app and authenticated Spotify account. Full histories and sessions are not stored in this milestone.
+
+To reset mappings, stop the app and remove the match database; this also removes corrections. Remove `LastSync/` entries in Windows Credential Manager to remove saved account credentials. Do not distribute your settings, database or credential exports.
+
+## Test
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe -m compileall -q lastsync.py lastsync_core
+.\.venv\Scripts\python.exe lastsync.py --check
 ```
 
----
+Tests use deterministic clocks, mocked HTTP and offscreen native Qt. They neither contact music services nor touch real settings. See [the audit](docs/AUDIT.md) for findings and remaining real-account checks.
 
-## Running the app
+## Build executable and installer
 
-```bash
-python lastsync.py
+```powershell
+.\.venv\Scripts\python.exe -m pip install '.[build]'
+.\.venv\Scripts\python.exe -m PyInstaller --noconfirm packaging/LastSync.spec
 ```
 
----
+Build on Windows with Python 3.12+. The output is `dist/LastSync.exe`, a native windowed executable with Qt/httpx and no UPX.
 
-## First-time setup (IMPORTANT)
+For an installer, install [Inno Setup 6](https://jrsoftware.org/isinfo.php) and compile `packaging/LastSync.iss` with `ISCC.exe`. It installs per-user without administrator rights and creates Start Menu shortcuts. Uninstall preserves credentials and settings. An uncompiled `.iss` file is not an installer.
 
-When the app opens:
+## Architecture and roadmap
 
-1. Click the **⚙ (settings icon)**
-2. Fill in:
+`lastsync.py` retains the original native widgets and window. `lastsync_core/` separates models, adapters, matching, SQLite, synchronization, secure configuration, PKCE and Qt workers.
 
-   * Last.fm username (the person you want to sync with)
-   * Last.fm API key
-   * Spotify Client ID
-   * Spotify Client Secret
-3. Click **SAVE**
+This is the **1.1 stabilization milestone**, including security foundations brought forward from 1.2. The device selector and broader storage, multi-user dashboard, Music DNA, collections, historical analytics and optional direct protocol remain later milestones. No placeholder screens stand in for these features.
 
----
+## Verified service references
 
-## Using the app
+- [Spotify playback](https://developer.spotify.com/documentation/web-api/reference/start-a-users-playback)
+- [PKCE](https://developer.spotify.com/documentation/web-api/tutorials/code-pkce-flow) and [redirect URIs](https://developer.spotify.com/documentation/web-api/concepts/redirect_uri)
+- [Rate limits](https://developer.spotify.com/documentation/web-api/concepts/rate-limits)
+- [Development Mode migration guide](https://developer.spotify.com/documentation/web-api/tutorials/february-2026-migration-guide)
+- [Last.fm recent tracks](https://www.last.fm/api/show/user.getRecentTracks)
 
-1. Make sure Spotify is open on your device
-2. Click **START SYNC**
-3. A browser window will open → log into Spotify
-4. Approve access
-
-After that:
-
-* The app will start syncing automatically
-* You’ll see the track name + progress bar
-* It keeps updating in the background
-
-You can minimize it — it runs in the system tray.
-
----
-
-## What you’ll see
-
-* Current track + artist
-* Progress bar (shows where you are in the song)
-* Live indicator (green pulse = syncing)
-* Activity log (what’s happening)
-* Poll speed (how often it checks)
-
----
-
-## Important things to know
-
-* Spotify MUST already be open
-* The app will override whatever you're currently playing
-* There will always be a small delay (Last.fm limitation)
-* Some songs may not exist on Spotify
-* The person’s Last.fm profile must be public
-
----
-
-## If something doesn’t work
-
-### Nothing is playing
-
-* Check if the person is actually listening to something
-* Last.fm only shows “now playing” sometimes
-
----
-
-### Spotify doesn’t play anything
-
-* Open Spotify manually
-* Play any song once
-* Then try again
-
----
-
-### Login issues
-
-* Make sure your redirect URI is exactly:
-
-  ```
-  http://127.0.0.1:8888/callback
-  ```
-
----
-
-### App crashes
-
-* Make sure you installed:
-
-  ```
-  pip install pyqt6 spotipy requests
-  ```
-
----
-
-## Files created by the app
-
-After running, you’ll see:
-
-* `.lastsync_config.json` → your saved credentials
-* `.lastsync_spotify_cache` → Spotify login cache
-
-These are stored locally on your system.
-
----
-
-## Safety note
-
-Do NOT share:
-
-* your Spotify Client Secret
-* your config file
-
-They give access to your account.
-
----
-
-## That’s it
-
-Start the app, hit sync, and you’re listening along.
-
----
+Search requests use at most ten results each and tolerate missing catalog fields. Actual access remains subject to the app's scopes and access mode. LastSync controls your own client; it does not stream audio or bypass platform restrictions.

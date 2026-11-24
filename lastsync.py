@@ -1,31 +1,24 @@
 import sys
-import json
 import time
-import threading
-import requests
+import os
+import os
 from datetime import datetime
 from pathlib import Path
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QLabel, QPushButton, QFrame, QDialog,
-    QLineEdit, QMessageBox, QSystemTrayIcon, QMenu, QScrollArea
+    QLineEdit, QMessageBox, QSystemTrayIcon, QMenu, QScrollArea, QListWidget
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import (
     QFont, QColor, QPainter, QBrush, QIcon, QPixmap, QPen,
     QFontDatabase, QPainterPath
 )
-import spotipy
-from spotipy.oauth2 import SpotifyOAuth
+from lastsync_core.config import DEFAULT_CONFIG as _DEFAULT_CONFIG, load_config, save_config
+from lastsync_core.workers import SyncWorker, AuthWorker, ArtLoader
+from lastsync_core.sync import POLL_ACTIVE, POLL_IDLE
 
-# ── Constants ──────────────────────────────────────────────────
-POLL_ACTIVE     = 2
-POLL_IDLE       = 5
-CONFIG_FILE     = Path.home() / ".lastsync_config.json"
-REDIRECT_URI    = "http://127.0.0.1:8888/callback"
-SPOTIFY_SCOPE   = "user-modify-playback-state user-read-playback-state"
 MAX_LOG_ENTRIES = 60
-FALLBACK_URI    = "spotify:track:4yur1GSBfuS1VADyUYocqd"
 
 # ── Palette ────────────────────────────────────────────────────
 C = {
@@ -44,220 +37,13 @@ C = {
     "text":        "#e8e8e8",
     "text_dim":    "#aaaaaa",
     "text_mid":    "#666666",
-    "text_muted":  "#444444",
-    "text_ghost":  "#2a2a2a",
+    "text_muted":  "#999999",
+    "text_ghost":  "#aaaaaa",
     "warn":        "#b08020",
     "error":       "#9b3a3a",
-    "fallback":    "#6a4a9a",
 }
 
-# ── Default config ─────────────────────────────────────────────
-_DEFAULT_CONFIG = {
-    "lastfm_user":           "",
-    "lastfm_api_key":        "",
-    "spotify_client_id":     "",
-    "spotify_client_secret": "",
-}
 
-# ── Config helpers ─────────────────────────────────────────────
-def load_config() -> dict:
-    if CONFIG_FILE.exists():
-        try:
-            data = json.loads(CONFIG_FILE.read_text())
-            return {**_DEFAULT_CONFIG, **data}
-        except Exception as e:
-            print(f"[lastsync] config load error: {e}")
-    return dict(_DEFAULT_CONFIG)
-
-def save_config(cfg: dict):
-    try:
-        CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
-    except Exception as e:
-        print(f"[lastsync] config save error: {e}")
-
-
-# ── Spotify search helper ──────────────────────────────────────
-def spotify_search(sp, track: str, artist: str):
-    """
-    Two-pass search so regional/special-char titles are still found:
-      Pass 1 — strict quoted:  track:"X" artist:"Y"
-      Pass 2 — loose unquoted: X Y
-    Returns items list or [].
-    """
-    for q in (
-        f'track:"{track}" artist:"{artist}"',
-        f'{track} {artist}',
-    ):
-        try:
-            res   = sp.search(q=q, type="track", limit=1)
-            items = res["tracks"]["items"]
-            if items:
-                return items
-        except Exception:
-            pass
-    return []
-
-
-# ── Sync worker ────────────────────────────────────────────────
-class SyncWorker(QThread):
-    track_changed         = pyqtSignal(str, str, int, int, str)
-    status_changed        = pyqtSignal(str, str)
-    idle_signal           = pyqtSignal()
-    poll_interval_changed = pyqtSignal(int)
-
-    def __init__(self, sp, cfg: dict):
-        super().__init__()
-        self._sp             = sp
-        self._cfg            = cfg
-        self._stop_event     = threading.Event()
-        self.last_played     = None
-        self._first_seen     = None
-        self._first_seen_key = None
-
-    def get_now_playing(self):
-        url = (
-            "https://ws.audioscrobbler.com/2.0/"
-            f"?method=user.getrecenttracks"
-            f"&user={self._cfg['lastfm_user']}"
-            f"&api_key={self._cfg['lastfm_api_key']}"
-            f"&format=json&limit=1"
-        )
-        resp   = requests.get(url, timeout=8)
-        resp.raise_for_status()
-        tracks = resp.json()["recenttracks"]["track"]
-        if isinstance(tracks, list) and tracks[0].get("@attr", {}).get("nowplaying"):
-            t          = tracks[0]
-            started_at = int(t.get("date", {}).get("uts", int(time.time())))
-            return t["name"], t["artist"]["#text"], started_at
-        return None, None, None
-
-    def search_and_play(self, track: str, artist: str, first_seen: float):
-        items = spotify_search(self._sp, track, artist)
-
-        if not items:
-            try:
-                self._sp.start_playback(uris=[FALLBACK_URI])
-            except Exception:
-                pass
-            return False, 0, ""
-
-        item        = items[0]
-        uri         = item["uri"]
-        duration_ms = item["duration_ms"]
-
-        art_url = ""
-        images  = item.get("album", {}).get("images", [])
-        if images:
-            sized   = [i for i in images if i.get("width", 0) >= 64]
-            art_url = (sized[-1] if sized else images[-1]).get("url", "")
-
-        elapsed_ms  = int((time.time() - first_seen) * 1000)
-        position_ms = max(0, min(elapsed_ms, duration_ms - 2000))
-        self._sp.start_playback(uris=[uri], position_ms=position_ms)
-        return True, duration_ms, art_url
-
-    def run(self):
-        self._stop_event.clear()
-        while not self._stop_event.is_set():
-            interval = POLL_IDLE
-            try:
-                track, artist, started_at = self.get_now_playing()
-
-                if track:
-                    interval = POLL_ACTIVE
-                    key      = (track, artist)
-
-                    if key != self.last_played:
-                        self._first_seen     = time.time()
-                        self._first_seen_key = key
-
-                        found, dur_ms, art_url = self.search_and_play(
-                            track, artist, self._first_seen
-                        )
-                        if found:
-                            self.last_played = key
-                            elapsed_ms = int((time.time() - self._first_seen) * 1000)
-                            self.track_changed.emit(
-                                track, artist, max(0, elapsed_ms), dur_ms, art_url
-                            )
-                        else:
-                            self.status_changed.emit(f"Not on Spotify: {track}", "warn")
-                    else:
-                        self.status_changed.emit("Synced ✓", "info")
-                else:
-                    self._first_seen     = None
-                    self._first_seen_key = None
-                    self.idle_signal.emit()
-
-            except spotipy.SpotifyException as e:
-                if e.http_status in (401, 403):
-                    self.status_changed.emit("Spotify auth error — check Settings", "auth")
-                    break
-                self.status_changed.emit(f"Spotify: {e}", "error")
-            except requests.HTTPError as e:
-                if e.response is not None and e.response.status_code in (401, 403):
-                    self.status_changed.emit("Last.fm auth error — check Settings", "auth")
-                    break
-                self.status_changed.emit(f"Last.fm: {e}", "error")
-            except requests.RequestException as e:
-                self.status_changed.emit(f"Network (will retry): {e}", "error")
-            except Exception as e:
-                self.status_changed.emit(str(e), "error")
-
-            self.poll_interval_changed.emit(interval)
-            self._stop_event.wait(timeout=interval)
-
-    def stop(self):
-        self._stop_event.set()
-
-
-# ── Auth worker ────────────────────────────────────────────────
-class AuthWorker(QThread):
-    auth_success = pyqtSignal(object)
-    auth_failed  = pyqtSignal(str)
-
-    def __init__(self, cfg: dict):
-        super().__init__()
-        self._cfg = cfg
-
-    def run(self):
-        try:
-            sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
-                client_id=self._cfg["spotify_client_id"],
-                client_secret=self._cfg["spotify_client_secret"],
-                redirect_uri=REDIRECT_URI,
-                scope=SPOTIFY_SCOPE,
-                cache_path=str(Path.home() / ".lastsync_spotify_cache"),
-            ))
-            sp.current_user()
-            self.auth_success.emit(sp)
-        except spotipy.SpotifyOauthError as e:
-            self.auth_failed.emit(f"Spotify OAuth: {e}")
-        except Exception as e:
-            self.auth_failed.emit(str(e))
-
-
-# ── Art loader ─────────────────────────────────────────────────
-class ArtLoader(QThread):
-    art_ready = pyqtSignal(QPixmap)
-
-    def __init__(self, url: str):
-        super().__init__()
-        self._url = url
-
-    def run(self):
-        try:
-            resp = requests.get(self._url, timeout=6)
-            resp.raise_for_status()
-            px = QPixmap()
-            px.loadFromData(resp.content)
-            if not px.isNull():
-                self.art_ready.emit(px)
-        except Exception:
-            pass
-
-
-# ── Pulse dot ──────────────────────────────────────────────────
 class PulseDot(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -359,11 +145,10 @@ class ProgressBar(QWidget):
 class LogRow(QWidget):
     _FG = {
         "track":    C["green"],
-        "info":     "#3a3a3a",
+        "info":     "#999999",
         "warn":     C["warn"],
         "error":    C["error"],
         "auth":     C["error"],
-        "fallback": C["fallback"],
     }
 
     def __init__(self, text: str, level: str, ts: str, parent=None):
@@ -377,7 +162,7 @@ class LogRow(QWidget):
 
         t = QLabel(ts)
         t.setFixedWidth(54)
-        t.setStyleSheet("color: #282828; font-family: Courier New; font-size: 8px;")
+        t.setStyleSheet("color: #999999; font-family: Courier New; font-size: 8px;")
         t.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
         dot = QLabel("●")
@@ -386,6 +171,7 @@ class LogRow(QWidget):
         dot.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
         msg = QLabel(text)
+        msg.setTextFormat(Qt.TextFormat.PlainText)
         msg.setStyleSheet(f"color: {fg}; font-family: Courier New; font-size: 9px;")
         msg.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
@@ -415,10 +201,10 @@ class LogPanel(QFrame):
         hdr = QHBoxLayout()
         hdr.setContentsMargins(12, 0, 12, 0)
         lbl = QLabel("ACTIVITY")
-        lbl.setStyleSheet("color: #282828; font-family: Courier New; font-size: 8px; "
+        lbl.setStyleSheet("color: #999999; font-family: Courier New; font-size: 8px; "
                           "font-weight: bold; letter-spacing: 3px; border: none;")
         self._cnt = QLabel("")
-        self._cnt.setStyleSheet("color: #303030; font-family: Courier New; font-size: 8px; border: none;")
+        self._cnt.setStyleSheet("color: #999999; font-family: Courier New; font-size: 8px; border: none;")
         hdr.addWidget(lbl)
         hdr.addStretch()
         hdr.addWidget(self._cnt)
@@ -469,7 +255,7 @@ class RevealButton(QPushButton):
         self.setFixedSize(28, 28)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setStyleSheet("""
-            QPushButton { background: transparent; border: none; color: #383838; font-size: 12px; }
+            QPushButton { background: transparent; border: none; color: #999999; font-size: 12px; }
             QPushButton:hover { color: #777777; }
         """)
         self.clicked.connect(self._toggle)
@@ -514,7 +300,7 @@ class SettingsDialog(QDialog):
 
         def section(txt):
             l = QLabel(txt)
-            l.setStyleSheet("color: #383838; font-family: Courier New; font-size: 8px; letter-spacing: 2px;")
+            l.setStyleSheet("color: #999999; font-family: Courier New; font-size: 8px; letter-spacing: 2px;")
             lay.addWidget(l)
             lay.addSpacing(6)
 
@@ -530,6 +316,7 @@ class SettingsDialog(QDialog):
             f.setMinimumHeight(40)
             hl.addWidget(f, 1)
             if pwd:
+                f.setEchoMode(QLineEdit.EchoMode.Password)
                 rb = RevealButton(f)
                 hl.addWidget(rb)
                 hl.setAlignment(rb, Qt.AlignmentFlag.AlignVCenter)
@@ -545,14 +332,12 @@ class SettingsDialog(QDialog):
 
         section("SPOTIFY")
         w3, self.sp_id  = field_row("client id",     pwd=True)
-        w4, self.sp_sec = field_row("client secret", pwd=True)
         lay.addWidget(w3)
         lay.addSpacing(8)
-        lay.addWidget(w4)
         lay.addSpacing(8)
 
-        hint = QLabel("A browser window will open to authorize Spotify on first connect.")
-        hint.setStyleSheet("color: #2c2c2c; font-family: Courier New; font-size: 8px;")
+        hint = QLabel("Spotify Premium required. PKCE authorization opens your browser. Credentials use OS storage.")
+        hint.setStyleSheet("color: #999999; font-family: Courier New; font-size: 8px;")
         hint.setWordWrap(True)
         lay.addWidget(hint)
         lay.addSpacing(22)
@@ -560,7 +345,6 @@ class SettingsDialog(QDialog):
         self.lfm_user.setText(cfg.get("lastfm_user", ""))
         self.lfm_key.setText(cfg.get("lastfm_api_key", ""))
         self.sp_id.setText(cfg.get("spotify_client_id", ""))
-        self.sp_sec.setText(cfg.get("spotify_client_secret", ""))
 
         btn_row = QHBoxLayout()
         cancel  = QPushButton("Cancel")
@@ -589,7 +373,6 @@ class SettingsDialog(QDialog):
             "lastfm_user":           self.lfm_user,
             "lastfm_api_key":        self.lfm_key,
             "spotify_client_id":     self.sp_id,
-            "spotify_client_secret": self.sp_sec,
         }
 
     def _on_save(self):
@@ -611,33 +394,91 @@ class SettingsDialog(QDialog):
 
 
 # ── Main window ────────────────────────────────────────────────
+class MatchDialog(QDialog):
+    def __init__(self, source, candidates, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Choose Spotify match")
+        self.setStyleSheet("QDialog { background: #111111; } QLabel { color: #dddddd; } "
+                          "QListWidget, QLineEdit { background: #161616; color: #dddddd; padding: 8px; } "
+                          "QPushButton { background: #1db954; color: black; padding: 8px; border-radius: 6px; }")
+        self.setMinimumSize(520, 300)
+        layout = QVBoxLayout(self)
+        label = QLabel(f"{source.title} - {source.artist}")
+        label.setTextFormat(Qt.TextFormat.PlainText)
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        self.items = QListWidget()
+        self.candidates = list(candidates)
+        for ranked in self.candidates:
+            track = ranked.candidate.track
+            self.items.addItem(f"{ranked.confidence:.0%} | {track.title} - {track.artist} | {track.album} | {ranked.reason}")
+        layout.addWidget(self.items)
+        self.custom = QLineEdit()
+        self.custom.setPlaceholderText("Or paste a Spotify track link / URI")
+        layout.addWidget(self.custom)
+        note = QLabel("Your choice is saved for this recording and Spotify account.")
+        layout.addWidget(note)
+        buttons = QHBoxLayout()
+        cancel, save = QPushButton("Cancel"), QPushButton("Use this track")
+        cancel.clicked.connect(self.reject)
+        save.clicked.connect(self._save)
+        buttons.addWidget(cancel)
+        buttons.addWidget(save)
+        layout.addLayout(buttons)
+
+    def uri(self):
+        if self.custom.text().strip():
+            return self.custom.text().strip()
+        row = self.items.currentRow()
+        return self.candidates[row].candidate.uri if row >= 0 else ""
+
+    def _save(self):
+        if self.uri():
+            self.accept()
+
+
 class LastSyncWindow(QMainWindow):
     BTN_R = 25
 
-    def __init__(self):
+    def __init__(self, cfg=None, prompt_settings=True):
         super().__init__()
-        self._cfg         = load_config()
-        self._sp          = None
-        self._worker      = None
-        self._auth_worker = None
-        self._art_loader  = None
-        self._syncing     = False
+        config_error = None
+        try:
+            self._cfg = dict(cfg) if cfg is not None else load_config()
+        except Exception as error:
+            self._cfg = dict(_DEFAULT_CONFIG)
+            config_error = str(error)
+        self._sp = self._worker = self._auth_worker = None
+        self._art_loaders = set()
+        self._art_generation = 0
+        self._syncing = self._closing = False
+        self._state = "IDLE"
+        self._match_request = None
+        self._progress_snapshot = None
         self._track_start = 0.0
         self._duration_ms = 0
-
         self._tick_timer = QTimer(self)
-        self._tick_timer.setInterval(1000)
+        self._tick_timer.setInterval(250)
         self._tick_timer.timeout.connect(self._tick_progress)
-
         self._init_fonts()
         self._init_ui()
         self._init_tray()
-
-        if not self._config_is_complete():
+        if config_error:
+            self.set_status(config_error)
+            self.log_panel.add_entry(config_error, "error")
+        elif prompt_settings and not self._config_is_complete():
             QTimer.singleShot(300, self._prompt_settings)
 
     def _init_fonts(self):
         fams        = QFontDatabase.families()
+        if not fams and sys.platform == "win32":
+            # Qt offscreen / isolated desktop sessions may not enumerate system fonts.
+            fonts = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts"
+            for name in ("segoeui.ttf", "georgia.ttf", "cour.ttf", "seguisym.ttf"):
+                QFontDatabase.addApplicationFont(str(fonts / name))
+            fams = QFontDatabase.families()
+            if "Segoe UI" in fams:
+                QApplication.instance().setFont(QFont("Segoe UI", 10))
         self._serif = "Georgia"     if "Georgia"     in fams else "DejaVu Serif"
         self._mono  = "Courier New" if "Courier New" in fams else "DejaVu Sans Mono"
 
@@ -645,9 +486,10 @@ class LastSyncWindow(QMainWindow):
         return QFont(family, size, QFont.Weight.Bold if bold else QFont.Weight.Normal)
 
     def _init_ui(self):
-        self.setWindowTitle("LastSync")
-        self.setFixedSize(440, 680)
-        self.setStyleSheet(f"background-color: {C['bg']};")
+        self.setWindowTitle("LastSync 1.1")
+        self.setMinimumSize(440, 680)
+        self.resize(440, 680)
+        self.setStyleSheet(f"QMainWindow {{ background-color: {C['bg']}; }} QLabel {{ background: transparent; }}")
 
         # Window icon
         px = QPixmap(64, 64)
@@ -689,7 +531,7 @@ class LastSyncWindow(QMainWindow):
         app_lbl.setStyleSheet(f"color: {C['text']}; letter-spacing: 5px;")
         self.sub_label = QLabel(f"with  {self._cfg.get('lastfm_user', '—')}")
         self.sub_label.setFont(self._f(self._mono, 8))
-        self.sub_label.setStyleSheet("color: #2a2a2a; letter-spacing: 1px;")
+        self.sub_label.setStyleSheet("color: #999999; letter-spacing: 1px;")
         title_col.addWidget(app_lbl)
         title_col.addWidget(self.sub_label)
 
@@ -698,7 +540,7 @@ class LastSyncWindow(QMainWindow):
         gear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         gear_btn.setToolTip("Settings")
         gear_btn.setStyleSheet(f"""
-            QPushButton {{ background: transparent; color: #404040; border: none; font-size: 14px; border-radius: 7px; }}
+            QPushButton {{ background: transparent; color: #999999; border: none; font-size: 14px; border-radius: 7px; }}
             QPushButton:hover {{ color: #888888; background: {C['bg3']}; }}
         """)
         gear_btn.clicked.connect(self._open_settings)
@@ -733,8 +575,8 @@ class LastSyncWindow(QMainWindow):
         ch = QHBoxLayout()
         np_lbl = QLabel("NOW PLAYING")
         np_lbl.setFont(self._f(self._mono, 7, bold=True))
-        np_lbl.setStyleSheet("color: #1e1e1e; letter-spacing: 4px;")
-        self.live_badge = QLabel("● LIVE")
+        np_lbl.setStyleSheet("color: #999999; letter-spacing: 4px;")
+        self.live_badge = QLabel("TRACK FOLLOW")
         self.live_badge.setFont(self._f(self._mono, 7, bold=True))
         self.live_badge.setStyleSheet(f"color: {C['green']}; letter-spacing: 2px;")
         self.live_badge.hide()
@@ -772,7 +614,7 @@ class LastSyncWindow(QMainWindow):
         self.artist_label.setMaximumHeight(28)
 
         # Small inline badge shown when track not on Spotify
-        self.unavail_badge = QLabel("⚠  not on Spotify — playing fallback")
+        self.unavail_badge = QLabel("Choose a match; playback unchanged")
         self.unavail_badge.setFont(self._f(self._mono, 7))
         self.unavail_badge.setStyleSheet(f"""
             color: {C['warn']}; background: #1a1200;
@@ -843,13 +685,23 @@ class LastSyncWindow(QMainWindow):
         self._btn_start()
         self.sync_btn.clicked.connect(self.toggle_sync)
         root.addWidget(self.sync_btn)
+        self.match_btn = QPushButton("CHOOSE SPOTIFY MATCH")
+        self.match_btn.setMinimumHeight(32)
+        self.match_btn.setStyleSheet("color: #bbbbbb; background: #161616; border-radius: 8px;")
+        self.match_btn.clicked.connect(self._choose_match)
+        self.match_btn.hide()
+        root.addWidget(self.match_btn)
+        for label in (self.track_label, self.artist_label, self.status_label, self.sub_label):
+            label.setTextFormat(Qt.TextFormat.PlainText)
+        self.status_label.setWordWrap(True)
+        self.status_label.setMinimumHeight(32)
 
         root.addSpacing(10)
 
         # ── Footer ───────────────────────────────────────────────
         self.footer_label = QLabel(self._footer_text())
         self.footer_label.setFont(self._f(self._mono, 7))
-        self.footer_label.setStyleSheet("color: #1c1c1c; letter-spacing: 1px;")
+        self.footer_label.setStyleSheet("color: #888888; letter-spacing: 1px;")
         self.footer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         root.addWidget(self.footer_label)
 
@@ -868,7 +720,7 @@ class LastSyncWindow(QMainWindow):
         """)
         menu.addAction("Show LastSync").triggered.connect(self._show_window)
         menu.addSeparator()
-        menu.addAction("Quit").triggered.connect(QApplication.quit)
+        menu.addAction("Quit").triggered.connect(self._begin_shutdown)
         self._tray.setContextMenu(menu)
         self._tray.activated.connect(
             lambda r: self._show_window()
@@ -924,18 +776,21 @@ class LastSyncWindow(QMainWindow):
         self._open_settings()
 
     def _open_settings(self):
+        if self._worker or self._auth_worker:
+            QMessageBox.information(self, "Settings", "Stop the current session before changing settings.")
+            return
         dlg = SettingsDialog(self._cfg, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         new = dlg.get_config()
-        if (new["spotify_client_id"]     != self._cfg.get("spotify_client_id") or
-                new["spotify_client_secret"] != self._cfg.get("spotify_client_secret")):
-            cache = Path.home() / ".lastsync_spotify_cache"
-            if cache.exists():
-                cache.unlink()
-            self._sp = None
+        try:
+            save_config(new)
+        except Exception:
+            QMessageBox.warning(self, "Settings not saved", "OS credential storage or the settings file is unavailable.")
+            return
+        if new["spotify_client_id"] != self._cfg.get("spotify_client_id"):
+            self._close_spotify()
         self._cfg = new
-        save_config(self._cfg)
         self._refresh_labels()
 
     def _refresh_labels(self):
@@ -944,13 +799,19 @@ class LastSyncWindow(QMainWindow):
 
     # ── Progress ──
     def _tick_progress(self):
-        if not self._track_start or not self._duration_ms:
+        playback = self._progress_snapshot
+        if playback is None or not playback.duration_ms:
             return
-        elapsed_ms = min(int((time.time() - self._track_start) * 1000), self._duration_ms)
-        self.progress_bar.set_progress(elapsed_ms / self._duration_ms)
-        self.elapsed_lbl.setText(self._ms(elapsed_ms))
+        age = max(0, time.monotonic() - playback.observed_monotonic)
+        if age > 10:
+            self.elapsed_lbl.setText("refreshing")
+            return
+        position = min(playback.duration_ms, playback.position_ms + (int(age * 1000) if playback.playing else 0))
+        self.progress_bar.set_progress(position / playback.duration_ms)
+        self.elapsed_lbl.setText(self._ms(position))
 
     @staticmethod
+
     def _ms(ms: int) -> str:
         s = ms // 1000
         return f"{s // 60}:{s % 60:02d}"
@@ -960,72 +821,108 @@ class LastSyncWindow(QMainWindow):
         self.stop_sync() if self._syncing else self.start_sync()
 
     def start_sync(self):
+        if self._worker or self._auth_worker or self._closing:
+            return
         if not self._config_is_complete():
             self._prompt_settings()
             return
         self._syncing = True
-        self.sync_btn.setText("CONNECTING…")
-        self.sync_btn.setEnabled(False)
-        self._btn_loading()
+        self.sync_btn.setText("CANCEL CONNECT")
+        self.sync_btn.setEnabled(True)
+        self._btn_stop()
         self.pulse.set_active(True)
-        self.set_status("Connecting to Spotify…")
-        self.track_label.setText("Waiting to sync…")
-        self.artist_label.setText("")
-        self.unavail_badge.hide()
-
+        self.set_status("Connecting to Spotify")
+        self._clear_card("Waiting to follow a track")
         if self._sp is not None:
             self._on_auth_ok(self._sp)
             return
-
-        self._auth_worker = AuthWorker(self._cfg)
-        self._auth_worker.auth_success.connect(self._on_auth_ok)
-        self._auth_worker.auth_failed.connect(self._on_auth_fail)
-        self._auth_worker.start()
+        worker = AuthWorker(self._cfg)
+        self._auth_worker = worker
+        worker.auth_success.connect(self._on_auth_ok)
+        worker.auth_failed.connect(self._on_auth_fail)
+        worker.finished.connect(self._auth_finished)
+        worker.start()
 
     def _on_auth_ok(self, sp):
+        if not self._syncing or self._closing:
+            sp.close()
+            sp.auth.close()
+            return
         self._sp = sp
         self.sync_btn.setText("STOP SYNC")
         self.sync_btn.setEnabled(True)
         self._btn_stop()
-        self.live_badge.show()
-        self.set_status("Connected — polling…")
-        self.log_panel.add_entry("Sync started", "info")
-
-        self._worker = SyncWorker(self._sp, self._cfg)
-        self._worker.track_changed.connect(self._on_track)
-        self._worker.status_changed.connect(self._on_status)
-        self._worker.idle_signal.connect(self._on_idle)
-        self._worker.poll_interval_changed.connect(self._on_poll_interval)
-        self._worker.start()
+        self.set_status("Connected; polling Last.fm")
+        self.log_panel.add_entry("Track Follow started; source position unknown", "info")
+        worker = SyncWorker(self._sp, self._cfg)
+        self._worker = worker
+        worker.track_changed.connect(self._on_track)
+        worker.status_changed.connect(self._on_status)
+        worker.state_changed.connect(self._on_state)
+        worker.playback_changed.connect(self._on_playback)
+        worker.matching_required.connect(self._on_match)
+        worker.poll_interval_changed.connect(self._on_poll_interval)
+        worker.finished.connect(self._sync_finished)
+        worker.start()
         self._tick_timer.start()
 
-    def _on_auth_fail(self, msg: str):
+    def _auth_finished(self):
+        worker = self._auth_worker
+        self._auth_worker = None
+        if worker:
+            worker.deleteLater()
+        if not self._syncing:
+            self._reset_button()
+
+    def _sync_finished(self):
+        worker = self._worker
+        self._worker = None
         self._syncing = False
+        self._tick_timer.stop()
+        self._progress_snapshot = None
+        self._close_spotify()
+        self.live_badge.hide()
+        self.match_btn.hide()
+        if worker:
+            worker.deleteLater()
+        self._reset_button()
+
+    def _reset_button(self):
         self.pulse.set_active(False)
+        self.sync_btn.setEnabled(not self._closing)
         self.sync_btn.setText("START SYNC")
-        self.sync_btn.setEnabled(True)
         self._btn_start()
-        self.track_label.setText("Start sync to listen along")
-        self.set_status("⚠ Auth failed — check Settings")
-        self.log_panel.add_entry(f"Auth failed: {msg}", "auth")
+
+    def _on_auth_fail(self, msg):
+        if not self._syncing:
+            return
+        self._syncing = False
+        self._reset_button()
+        self.set_status(msg)
+        self.log_panel.add_entry(msg, "auth")
 
     def stop_sync(self):
         self._syncing = False
-        self.pulse.set_active(False)
         self._tick_timer.stop()
+        self.pulse.set_active(False)
         self.live_badge.hide()
-        if self._worker:
-            self._worker.stop()
-            self._worker.wait()
-            self._worker = None
-        self.sync_btn.setText("START SYNC")
-        self.sync_btn.setEnabled(True)
-        self._btn_start()
+        self.match_btn.hide()
+        self._match_request = None
+        self._art_generation += 1
+        for loader in self._art_loaders:
+            loader.stop()
+        for worker in (self._worker, self._auth_worker):
+            if worker:
+                worker.stop()
         self._clear_card("Start sync to listen along")
         self.poll_label.setText("")
-        self.set_status("Stopped")
-        self._tray.setToolTip("LastSync · idle")
-        self.log_panel.add_entry("Sync stopped", "info")
+        self.set_status("Stopped; Spotify playback is unchanged")
+        self._tray.setToolTip("LastSync - idle")
+        if self._worker or self._auth_worker:
+            self.sync_btn.setText("STOPPING")
+            self.sync_btn.setEnabled(False)
+        else:
+            self._reset_button()
 
     def _clear_card(self, placeholder=""):
         self.track_label.setText(placeholder)
@@ -1039,65 +936,87 @@ class LastSyncWindow(QMainWindow):
         self.duration_lbl.setText("")
         self._track_start = 0.0
         self._duration_ms = 0
+        self._progress_snapshot = None
 
     # ── Handlers ──
-    def _on_track(self, track: str, artist: str, pos_ms: int, dur_ms: int, art_url: str):
-        display = track if len(track) <= 36 else track[:34] + "…"
-        self.track_label.setText(display)
-        self.track_label.setToolTip(track if len(track) > 36 else "")
+    def _on_track(self, track, artist, pos_ms, dur_ms, art_url):
+        if not self._syncing:
+            return
+        self.track_label.setText(track)
+        self.track_label.setToolTip(track)
         self.artist_label.setText(artist)
-        self.artist_label.setToolTip(artist if len(artist) > 36 else "")
         self.unavail_badge.hide()
-        self.set_status("Synced ✓")
-
-        self._track_start = time.time() - (pos_ms / 1000)
-        self._duration_ms = dur_ms
-        self.progress_bar.set_progress(pos_ms / dur_ms if dur_ms else 0)
-        self.elapsed_lbl.setText(self._ms(pos_ms))
+        self.match_btn.setText("CORRECT SPOTIFY MATCH")
+        self.match_btn.show()
         self.duration_lbl.setText(self._ms(dur_ms) if dur_ms else "")
-
-        self.log_panel.add_entry(f"{track} — {artist}", "track")
-        self._tray.setToolTip(f"LastSync · {track} — {artist}")
-
+        self.log_panel.add_entry(f"{track} - {artist}", "track")
+        self._tray.setToolTip(f"LastSync - {track} - {artist}")
+        self._art_generation += 1
+        for loader in self._art_loaders:
+            loader.stop()
         self.art_widget.clear()
-        if art_url:
-            self._art_loader = ArtLoader(art_url)
-            self._art_loader.art_ready.connect(self.art_widget.set_pixmap)
-            self._art_loader.start()
+        if art_url and len(self._art_loaders) < 2:
+            loader = ArtLoader(art_url, self._art_generation)
+            self._art_loaders.add(loader)
+            loader.art_ready.connect(self._on_art)
+            loader.finished.connect(lambda current=loader: self._art_finished(current))
+            loader.start()
 
-    def _on_status(self, msg: str, level: str):
-        if level == "auth":
-            self.set_status(f"⚠ {msg}")
-            self.log_panel.add_entry(msg, "auth")
-            self.stop_sync()
-        elif level == "warn":
-            raw = msg.replace("Not on Spotify: ", "", 1)
-            display = raw if len(raw) <= 36 else raw[:34] + "…"
-            self.track_label.setText(display)
-            self.track_label.setToolTip(raw)
-            self.artist_label.setText("")
-            self.art_widget.clear()
-            self.unavail_badge.show()
-            self.progress_bar.set_progress(0)
-            self.elapsed_lbl.setText("")
-            self.duration_lbl.setText("")
-            self._track_start = 0.0
-            self._duration_ms = 0
-            self.set_status("⚠ not on Spotify — playing fallback")
-            self.log_panel.add_entry(msg, "warn")
-            self.log_panel.add_entry("↳ playing fallback track", "fallback")
-        elif level == "error":
-            self.log_panel.add_entry(msg, "error")
-            if "Synced" not in self.status_label.text():
-                self.set_status(f"⚠ {msg}")
-        else:
-            self.set_status(msg)
+    def _on_art(self, raw, generation):
+        if self._syncing and generation == self._art_generation:
+            pixmap = QPixmap()
+            if pixmap.loadFromData(raw):
+                self.art_widget.set_pixmap(pixmap)
 
-    def _on_idle(self):
-        self._clear_card("Nothing playing")
-        user = self._cfg.get("lastfm_user", "them")
-        self.set_status(f"{user} isn't playing anything")
-        self._tray.setToolTip("LastSync · idle")
+    def _art_finished(self, loader):
+        self._art_loaders.discard(loader)
+        loader.deleteLater()
+
+    def _on_playback(self, playback):
+        if not self._syncing or self._state == "IDLE":
+            return
+        self._progress_snapshot = playback
+        self.duration_lbl.setText(self._ms(playback.duration_ms) if playback.duration_ms else "")
+        self.elapsed_lbl.setToolTip("Your Spotify playback position; the source position is unknown")
+        self._tick_progress()
+
+    def _on_state(self, state, message):
+        if not self._syncing:
+            return
+        self._state = state
+        self.live_badge.setVisible(state == "FOLLOWING")
+        self.set_status(message)
+        self.log_panel.add_entry(f"{state}: {message}", "error" if state == "STOPPED" else "info")
+        if state == "IDLE":
+            self._clear_card("Last.fm reports no current track")
+            self.match_btn.hide()
+            self._match_request = None
+        if state == "STOPPED":
+            self._tick_timer.stop()
+
+    def _on_match(self, event_id, source, candidates):
+        if not self._syncing:
+            return
+        self._match_request = (event_id, source, candidates)
+        self._art_generation += 1
+        self._clear_card(source.title)
+        self.artist_label.setText(source.artist)
+        self.match_btn.setText("CHOOSE SPOTIFY MATCH")
+        self.match_btn.show()
+        self.unavail_badge.setVisible(bool(candidates))
+
+    def _choose_match(self):
+        if self._match_request is None or self._worker is None:
+            return
+        event_id, source, candidates = self._match_request
+        dialog = MatchDialog(source, candidates, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted and self._worker:
+            self._worker.choose_match(event_id, dialog.uri())
+
+    def _on_status(self, message, level):
+        if self._syncing:
+            self.set_status(message)
+            self.log_panel.add_entry(message, level)
 
     def _on_poll_interval(self, interval: int):
         self.poll_label.setText(f"↻ {interval}s")
@@ -1108,22 +1027,65 @@ class LastSyncWindow(QMainWindow):
 
     def set_status(self, msg: str):
         self.status_label.setText(msg)
+        self.status_label.setToolTip(msg)
+
+    def _close_spotify(self):
+        if self._sp:
+            self._sp.close()
+            self._sp.auth.close()
+            self._sp = None
+
+    def _begin_shutdown(self):
+        if self._closing:
+            return
+        self._closing = True
+        self.stop_sync()
+        self.set_status("Closing background services")
+        self._finish_shutdown()
+
+    def _finish_shutdown(self):
+        workers = [self._worker, self._auth_worker, *self._art_loaders]
+        if any(worker and worker.isRunning() for worker in workers):
+            QTimer.singleShot(100, self._finish_shutdown)
+            return
+        self._close_spotify()
+        self._tray.hide()
+        QApplication.instance().quit()
 
     def closeEvent(self, event):
-        self._tick_timer.stop()
-        if self._worker:
-            self._worker.stop()
-            self._worker.wait()
-        if self._auth_worker and self._auth_worker.isRunning():
-            self._auth_worker.wait()
-        event.accept()
+        if QSystemTrayIcon.isSystemTrayAvailable() and not self._closing:
+            self.hide()
+            event.ignore()
+        elif not self._closing:
+            event.ignore()
+            self._begin_shutdown()
+        else:
+            event.accept()
 
 
-# ── Entry point ────────────────────────────────────────────────
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
+def main(argv=None):
+    if sys.version_info < (3, 12):
+        raise SystemExit("LastSync requires Python 3.12 or newer")
+    argv = list(sys.argv if argv is None else argv)
+    check = "--check" in argv
+    if check:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    app = QApplication(argv)
     app.setStyle("Fusion")
     app.setQuitOnLastWindowClosed(False)
-    window = LastSyncWindow()
+    window = LastSyncWindow(dict(_DEFAULT_CONFIG), prompt_settings=False) if check else LastSyncWindow()
     window.show()
-    sys.exit(app.exec())
+    if check:
+        app.processEvents()
+        if window.grab().isNull():
+            return 1
+        window._tray.hide()
+        window._closing = True
+        window.close()
+        print("LastSync native startup check passed (no accounts or network used)")
+        return 0
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

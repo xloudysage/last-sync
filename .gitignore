@@ -14,3 +14,14 @@ __pycache__/
 venv/
 env/
 .venv/
+
+# Legacy credentials and local application data
+.lastsync_config.json
+.lastsync_spotify_cache
+*.sqlite3
+*.sqlite3-*
+*.db
+*.log
+build/
+dist/
+*.egg-info/
